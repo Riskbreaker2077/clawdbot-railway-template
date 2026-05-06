@@ -1,92 +1,42 @@
-# Build openclaw from source to avoid npm packaging gaps (some dist files are not shipped).
-FROM node:22-bookworm AS openclaw-build
-
-# Dependencies needed for openclaw build
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    git \
-    ca-certificates \
-    curl \
-    python3 \
-    make \
-    g++ \
-  && rm -rf /var/lib/apt/lists/*
-
-# Install Bun (openclaw build uses it)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
-RUN corepack enable
-
 WORKDIR /openclaw
 
-# Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
-# Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
+# Variables de entorno que ganan sobre cualquier archivo de configuración
+ENV NPM_CONFIG_MINIMUM_RELEASE_AGE=0
+ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=0
+ENV COREPACK_ENABLE_STRICT=0
+
 ARG OPENCLAW_GIT_REF=v2026.3.8
 RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
-# Patch: relax version requirements for packages that may reference unpublished versions.
-# Apply to all extension package.json files to handle workspace protocol (workspace:*).
+# Patch: relax version requirements para extensiones
 RUN set -eux; \
   find ./extensions -name 'package.json' -type f | while read -r f; do \
     sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
     sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
   done
 
-RUN printf 'minimumReleaseAge: 0\n' > pnpm-workspace.yaml
-RUN node -e "const fs=require('fs');const f='package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));delete p.pnpm;delete p.patchedDependencies;fs.writeFileSync(f,JSON.stringify(p,null,2));"  || true
-RUN [ -f .npmrc ] && sed -i '/minimumReleaseAge/d' .npmrc || true
-RUN pnpm install --no-frozen-lockfile
+# NO sobreescribir pnpm-workspace.yaml — solo eliminar la línea problemática si existe
+RUN if [ -f pnpm-workspace.yaml ]; then \
+      sed -i '/minimumReleaseAge/Id' pnpm-workspace.yaml; \
+    fi
+
+# Limpiar minimumReleaseAge de TODOS los package.json del monorepo, no solo el raíz
+RUN find . -name 'package.json' -not -path '*/node_modules/*' -type f | while read -r f; do \
+      node -e "try{const fs=require('fs');const p=JSON.parse(fs.readFileSync('$f','utf8'));let changed=false;if(p.pnpm&&p.pnpm.minimumReleaseAge!==undefined){delete p.pnpm.minimumReleaseAge;changed=true;}if(p.pnpm&&p.pnpm.minimumReleaseAgeExclude!==undefined){delete p.pnpm.minimumReleaseAgeExclude;changed=true;}if(changed)fs.writeFileSync('$f',JSON.stringify(p,null,2));}catch(e){}"; \
+    done
+
+# Limpieza de .npmrc y .pnpmrc en raíz y subpaquetes
+RUN find . -name '.npmrc' -not -path '*/node_modules/*' -type f -exec sed -i '/minimumReleaseAge/Id' {} \; || true
+RUN find . -name '.pnpmrc' -not -path '*/node_modules/*' -type f -exec sed -i '/minimumReleaseAge/Id' {} \; || true
+
+# Diagnóstico — DEJA ESTAS LÍNEAS la primera vez que rebuildeas
+RUN echo "=== pnpm config list ===" && pnpm config list 2>&1 | grep -i release || echo "no release-age in pnpm config"
+RUN echo "=== env vars ===" && env | grep -iE 'release|npm_config|pnpm' || echo "no relevant env"
+RUN echo "=== pnpm-workspace.yaml ===" && cat pnpm-workspace.yaml
+RUN echo "=== root package.json pnpm key ===" && node -e "const p=require('./package.json');console.log(JSON.stringify(p.pnpm||{},null,2))"
+RUN echo "=== files con minimumReleaseAge ===" && grep -rln "minimumReleaseAge" . --include='*.yaml' --include='*.yml' --include='*.json' --include='.npmrc' --include='.pnpmrc' 2>/dev/null | grep -v node_modules || echo "ninguno"
+
+# Install con flag explícito como red de seguridad final
+RUN pnpm install --no-frozen-lockfile --config.minimum-release-age=0
+
 RUN pnpm build
-ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:install && pnpm ui:build
-
-
-# Runtime image
-FROM node:22-bookworm
-ENV NODE_ENV=production
-
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates \
-    tini \
-    python3 \
-    python3-venv \
-  && rm -rf /var/lib/apt/lists/*
-
-# `openclaw update` expects pnpm. Provide it in the runtime image.
-RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
-
-# Persist user-installed tools by default by targeting the Railway volume.
-# - npm global installs -> /data/npm
-# - pnpm global installs -> /data/pnpm (binaries) + /data/pnpm-store (store)
-ENV NPM_CONFIG_PREFIX=/data/npm
-ENV NPM_CONFIG_CACHE=/data/npm-cache
-ENV PNPM_HOME=/data/pnpm
-ENV PNPM_STORE_DIR=/data/pnpm-store
-ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
-
-WORKDIR /app
-
-# Wrapper deps
-COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
-
-# Copy built openclaw
-COPY --from=openclaw-build /openclaw /openclaw
-
-# Provide an openclaw executable
-RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
-  && chmod +x /usr/local/bin/openclaw
-
-COPY src ./src
-
-# The wrapper listens on $PORT.
-# IMPORTANT: Do not set a default PORT here.
-# Railway injects PORT at runtime and routes traffic to that port.
-# If we force a different port, deployments can come up but the domain will route elsewhere.
-EXPOSE 8080
-
-# Ensure PID 1 reaps zombies and forwards signals.
-ENTRYPOINT ["tini", "--"]
-CMD ["node", "src/server.js"]
