@@ -34,7 +34,8 @@ RUN set -eux; \
   done
 
 RUN printf 'minimumReleaseAge: 0\n' > pnpm-workspace.yaml
-RUN node -e "const fs=require('fs');const f='package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));delete p.pnpm;delete p.patchedDependencies;fs.writeFileSync(f,JSON.stringify(p,null,2));" || true
+RUN node -e "const fs=require('fs');const f='package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));delete p.pnpm;delete p.patchedDependencies;fs.writeFileSync(f,JSON.stringify(p,null,2));"  || true
+RUN [ -f .npmrc ] && sed -i '/minimumReleaseAge/d' .npmrc || true
 RUN pnpm install --no-frozen-lockfile
 RUN pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
