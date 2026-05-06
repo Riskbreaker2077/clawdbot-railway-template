@@ -34,6 +34,7 @@ RUN set -eux; \
   done
 
 RUN printf 'minimumReleaseAge: 0\n' > pnpm-workspace.yaml
+RUN node -e "const fs=require('fs');const f='pnpm-workspace.yaml';let c=fs.readFileSync(f,'utf8');c=c.replace(/patchedDependencies:[\s\S]*/,'');fs.writeFileSync(f,c);" || true
 RUN pnpm install --no-frozen-lockfile
 RUN pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
