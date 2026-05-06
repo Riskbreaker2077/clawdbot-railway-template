@@ -1,42 +1,36 @@
-WORKDIR /openclaw
+ARG OPENCLAW_VERSION=2026.5.2
+FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION} AS openclaw-build
 
-# Variables de entorno que ganan sobre cualquier archivo de configuración
-ENV NPM_CONFIG_MINIMUM_RELEASE_AGE=0
-ENV PNPM_CONFIG_MINIMUM_RELEASE_AGE=0
-ENV COREPACK_ENABLE_STRICT=0
+FROM node:22-bookworm
+ENV NODE_ENV=production
 
-ARG OPENCLAW_GIT_REF=v2026.3.8
-RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates tini python3 python3-venv \
+  && rm -rf /var/lib/apt/lists/*
 
-# Patch: relax version requirements para extensiones
-RUN set -eux; \
-  find ./extensions -name 'package.json' -type f | while read -r f; do \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
-  done
+RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
-# NO sobreescribir pnpm-workspace.yaml — solo eliminar la línea problemática si existe
-RUN if [ -f pnpm-workspace.yaml ]; then \
-      sed -i '/minimumReleaseAge/Id' pnpm-workspace.yaml; \
-    fi
+ENV NPM_CONFIG_PREFIX=/data/npm
+ENV NPM_CONFIG_CACHE=/data/npm-cache
+ENV PNPM_HOME=/data/pnpm
+ENV PNPM_STORE_DIR=/data/pnpm-store
+ENV PATH="/data/npm/bin:/data/pnpm:${PATH}"
 
-# Limpiar minimumReleaseAge de TODOS los package.json del monorepo, no solo el raíz
-RUN find . -name 'package.json' -not -path '*/node_modules/*' -type f | while read -r f; do \
-      node -e "try{const fs=require('fs');const p=JSON.parse(fs.readFileSync('$f','utf8'));let changed=false;if(p.pnpm&&p.pnpm.minimumReleaseAge!==undefined){delete p.pnpm.minimumReleaseAge;changed=true;}if(p.pnpm&&p.pnpm.minimumReleaseAgeExclude!==undefined){delete p.pnpm.minimumReleaseAgeExclude;changed=true;}if(changed)fs.writeFileSync('$f',JSON.stringify(p,null,2));}catch(e){}"; \
-    done
+WORKDIR /app
 
-# Limpieza de .npmrc y .pnpmrc en raíz y subpaquetes
-RUN find . -name '.npmrc' -not -path '*/node_modules/*' -type f -exec sed -i '/minimumReleaseAge/Id' {} \; || true
-RUN find . -name '.pnpmrc' -not -path '*/node_modules/*' -type f -exec sed -i '/minimumReleaseAge/Id' {} \; || true
+COPY package.json ./
+RUN npm install --omit=dev && npm cache clean --force
 
-# Diagnóstico — DEJA ESTAS LÍNEAS la primera vez que rebuildeas
-RUN echo "=== pnpm config list ===" && pnpm config list 2>&1 | grep -i release || echo "no release-age in pnpm config"
-RUN echo "=== env vars ===" && env | grep -iE 'release|npm_config|pnpm' || echo "no relevant env"
-RUN echo "=== pnpm-workspace.yaml ===" && cat pnpm-workspace.yaml
-RUN echo "=== root package.json pnpm key ===" && node -e "const p=require('./package.json');console.log(JSON.stringify(p.pnpm||{},null,2))"
-RUN echo "=== files con minimumReleaseAge ===" && grep -rln "minimumReleaseAge" . --include='*.yaml' --include='*.yml' --include='*.json' --include='.npmrc' --include='.pnpmrc' 2>/dev/null | grep -v node_modules || echo "ninguno"
+# Copiar OpenClaw ya compilado desde la imagen oficial
+COPY --from=openclaw-build /app /openclaw
 
-# Install con flag explícito como red de seguridad final
-RUN pnpm install --no-frozen-lockfile --config.minimum-release-age=0
+# Shim apunta a openclaw.mjs (el entrypoint real de la imagen oficial)
+RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
+  && chmod +x /usr/local/bin/openclaw
 
-RUN pnpm build
+COPY src ./src
+
+EXPOSE 8080
+ENTRYPOINT ["tini", "--"]
+CMD ["node", "src/server.js"]
